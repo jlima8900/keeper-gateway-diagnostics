@@ -62,10 +62,15 @@ function Protect-Secrets {
   param([string]$Text)
   if ($null -eq $Text) { return $Text }
   $keys = '([A-Za-z0-9_]*(PASSWORD|PASSWD|PWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|PASSPHRASE|CREDENTIALS?|_KEY|_SEED|SEED)|GATEWAY_CONFIG|KCM_LICENSE)'
-  $Text = [regex]::Replace($Text, "(?i)($keys\s*[:=]\s*`"?)([^`"\s]+)", '$1[REDACTED]')
+  # multi-line PEM private-key blocks
+  $Text = [regex]::Replace($Text, '(?s)(-----BEGIN [A-Z ]*PRIVATE KEY-----).*?(-----END [A-Z ]*PRIVATE KEY-----)', '$1[REDACTED_PRIVATE_KEY]$2')
+  # keyed secrets: quoted value first (keeps spaces inside quotes), then unquoted-to-EOL
+  $Text = [regex]::Replace($Text, "(?im)($keys\s*[:=]\s*)`"[^`"]*`"", '$1"[REDACTED]"')
+  $Text = [regex]::Replace($Text, "(?im)($keys\s*[:=]\s*)[^`"\s].*$", '$1[REDACTED]')
   $Text = [regex]::Replace($Text, '(?i)(bearer )([A-Za-z0-9._~+/=-]{8,})', '$1[REDACTED]')
   $Text = [regex]::Replace($Text, '(://[^:/@\s]+:)([^@/\s]+)@', '$1[REDACTED]@')
   $Text = [regex]::Replace($Text, 'AKIA[0-9A-Z]{16}', '[REDACTED_AWS_KEY]')
+  $Text = [regex]::Replace($Text, 'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '[REDACTED_JWT]')
   $Text = [regex]::Replace($Text, '[A-Za-z0-9+/_-]{40,}={0,2}', '[REDACTED_LONG_TOKEN]')
   return $Text
 }
@@ -75,6 +80,18 @@ function Cap {
   try { $o = & $Script 2>&1 | Out-String } catch { $o = "(command failed: $_)" }
   if ($Redact) { $o = Protect-Secrets $o }
   Add-Content -Path $File -Value $o
+}
+
+# Portable TCP probe -- Test-NetConnection is absent on PowerShell Core / Server
+# Core / hardened Windows; a missing cmdlet would otherwise mis-report BLOCKED.
+function Test-Tcp {
+  param([string]$ComputerName, [int]$Port, [int]$TimeoutMs = 6000)
+  try {
+    $c = [System.Net.Sockets.TcpClient]::new()
+    $iar = $c.BeginConnect($ComputerName, $Port, $null, $null)
+    if ($iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { $c.EndConnect($iar); $c.Close(); return $true }
+    $c.Close(); return $false
+  } catch { return $false }
 }
 
 Write-Host "Keeper Gateway diagnostic collector (Windows)"
@@ -105,8 +122,9 @@ $timeFile = Join-Path $out 'host\time.txt'
 Cap $timeFile { Get-Date; w32tm /query /status }
 try {
   $st = (w32tm /query /status 2>&1 | Out-String)
-  if ($st -match 'not synchronized' -or $st -notmatch 'Source:') {
-    Note "WARN: Windows Time (w32tm) does not look synchronized -- clock skew breaks TLS to the router/relay; check 'w32tm /query /status'"
+  # best-effort, English-locale heuristic -- only WARN on explicit failure signals
+  if ($st -match 'not synchronized|0x800705B4|The service has not been started') {
+    Note "WARN: Windows Time may not be synchronized (best-effort check) -- clock skew breaks TLS to the router/relay; verify 'w32tm /query /status'"
   }
 } catch {}
 
@@ -159,10 +177,9 @@ if (-not $NoNetwork) {
     "  -- probe results --"
   ) | Add-Content $rf
   foreach ($hp in @(@($Router,443), @($Cloud,443), @($Relay,3478))) {
-    $r = Test-NetConnection -ComputerName $hp[0] -Port $hp[1] -WarningAction SilentlyContinue
-    $line = "TCP $($hp[0]):$($hp[1]) -> $(if ($r.TcpTestSucceeded){'OPEN'}else{'BLOCKED'})"
-    Add-Content $rf $line
-    if (-not $r.TcpTestSucceeded) { Note "WARN: $($hp[0]):$($hp[1]) not reachable" }
+    $ok = Test-Tcp -ComputerName $hp[0] -Port $hp[1]
+    Add-Content $rf ("TCP {0}:{1} -> {2}" -f $hp[0], $hp[1], $(if ($ok){'OPEN'}else{'BLOCKED'}))
+    if (-not $ok) { Note "WARN: $($hp[0]):$($hp[1]) not reachable" }
   }
   # TLS cert of the router
   try {
@@ -198,9 +215,9 @@ if ($Target) {
     Add-Content $tf "DNS $th -> $($dns.IPAddress -join ',')"
   } catch { Add-Content $tf "DNS resolution of $th FAILED: $_" }
   if ($tp) {
-    $r = Test-NetConnection -ComputerName $th -Port $tp -WarningAction SilentlyContinue
-    Add-Content $tf "TCP $th`:$tp -> $(if ($r.TcpTestSucceeded){'reachable'}else{'NOT reachable'})"
-    if (-not $r.TcpTestSucceeded) { Note "rotation/connection target $Target not reachable (DNS or routing) -- see network/target.txt" }
+    $ok = Test-Tcp -ComputerName $th -Port $tp
+    Add-Content $tf ("TCP {0}:{1} -> {2}" -f $th, $tp, $(if ($ok){'reachable'}else{'NOT reachable'}))
+    if (-not $ok) { Note "rotation/connection target $Target not reachable (DNS or routing) -- see network/target.txt" }
   }
 }
 
@@ -236,7 +253,7 @@ third parties. Secrets are redacted best-effort + scanned (see REDACTION-SCAN.tx
 
 Write-Host "[*] Secret scan"
 $scan = Join-Path $out 'REDACTION-SCAN.txt'
-$pat = '(?i)(-----BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|://[^:/@\s]+:[^@/\s]+@|(PASSWORD|PASSWD|PWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|PASSPHRASE|_SEED)`"?\s*[:=]\s*`"?[^\s`",}]{6,})'
+$pat = '(?i)(-----BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}|://[^:/@\s]+:[^@/\s]+@|(GATEWAY_CONFIG|KCM_LICENSE|[A-Za-z0-9_]*(PASSWORD|PASSWD|PWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|PASSPHRASE|CREDENTIALS?|_KEY|_SEED|SEED))`"?\s*[:=]\s*`"?[^\s`",}]{6,})'
 $hits = Get-ChildItem -Path $out -Recurse -File | Where-Object { $_.Name -ne 'REDACTION-SCAN.txt' } |
   Select-String -Pattern $pat | Where-Object { $_.Line -notmatch 'REDACTED' }
 if ($hits) {

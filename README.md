@@ -73,9 +73,9 @@ On **Windows** (PowerShell, run as Administrator):
 
 This bundle is built to be shareable, but **you are the last line of review.**
 
-- **Secrets are redacted** to `[REDACTED]`: `GATEWAY_CONFIG`, and any key name ending in `PASSWORD/PASSWD/PWD/SECRET/TOKEN/API_KEY/PRIVATE_KEY/PASSPHRASE/CREDENTIAL/_KEY/_SEED`, plus Bearer tokens, basic-auth in URLs, AWS keys, and any long base64/hex blob in config/env/inspect files. Over-redaction is the intended failure mode.
+- **Secrets are redacted** to `[REDACTED]`: `GATEWAY_CONFIG`, `KCM_LICENSE`, and any key name ending in `PASSWORD/PASSWD/PWD/SECRET/TOKEN/API_KEY/PRIVATE_KEY/PASSPHRASE/CREDENTIAL/_KEY/_SEED`, plus Bearer tokens, basic-auth in URLs, AWS keys, JWTs, multi-line PEM private-key blocks, and long base64/hex blobs. Values with spaces (quoted or not) are masked in full. Over-redaction is the intended failure mode.
 - A final **secret-scan** greps the whole bundle for residual secret patterns and writes `REDACTION-SCAN.txt` (and warns if anything survives).
-- **Never captured:** the gateway config file / `GATEWAY_CONFIG` payload, `.env` files, secret values, or `keeper get --unmask` output.
+- **Not captured:** the gateway config file / `GATEWAY_CONFIG` payload and `keeper get --unmask` output are never collected. Raw `.env` files are not read either — but environment values that reach the container *are* captured (redacted) in `container_env.txt`/`inspect.json`, so review those if a secret uses an unusual variable name.
 - **Full mode captures broad host context** (every container, all interfaces, the complete firewall ruleset, all listening ports, `/etc/hosts`). None of it is secret, but together it reveals your infrastructure topology. Use **`--minimal`** to scope this down when the recipient is a third party. Each bundle includes a `COLLECTION-NOTICE.txt` describing exactly what it contains.
 
 ## Requirements

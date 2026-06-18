@@ -74,7 +74,7 @@ while [ $# -gt 0 ]; do
     --enable-debug) DEBUG_ACTION="enable"; shift ;;
     --disable-debug) DEBUG_ACTION="disable"; shift ;;
     --compose-file) COMPOSE_FILE="${2:-}"; shift 2 ;;
-    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -n 52; exit 0 ;;
+    -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -n 60; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -148,11 +148,11 @@ services:
 YAML
     echo "[debug] wrote override: $OVR"
     echo "[debug] recreating service '$SVC' (brief gateway restart)..."
-    "${DC[@]}" -p "$PROJ" "${FARGS[@]}" -f "$OVR" up -d "$SVC" || { echo "compose up failed" >&2; exit 1; }
+    "${DC[@]}" -p "$PROJ" ${FARGS[@]+"${FARGS[@]}"} -f "$OVR" up -d "$SVC" || { echo "compose up failed" >&2; exit 1; }
   else
     if [ -f "$OVR" ]; then rm -f "$OVR"; echo "[debug] removed override: $OVR"; else echo "[debug] no override file at $OVR (already reverted?)"; fi
     echo "[debug] recreating service '$SVC' to restore the prior log level..."
-    "${DC[@]}" -p "$PROJ" "${FARGS[@]}" up -d "$SVC" || { echo "compose up failed" >&2; exit 1; }
+    "${DC[@]}" -p "$PROJ" ${FARGS[@]+"${FARGS[@]}"} up -d "$SVC" || { echo "compose up failed" >&2; exit 1; }
   fi
   echo "[debug] waiting for the container to settle..."
   for _ in 1 2 3 4 5; do command -v sleep >/dev/null && sleep 1; done
@@ -175,19 +175,24 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # masked; that's fine). Also masks bearer tokens, basic-auth in URLs, and AWS
 # access keys. 'strict' additionally masks any long base64/hex blob.
 SECRET_KEYS='GATEWAY_CONFIG|[A-Za-z0-9_]*(PASSWORD|PASSWD|PWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|PASSPHRASE|CREDENTIALS?|_KEY|_SEED|SEED)|KCM_LICENSE'
+# multi-line PEM private-key blocks: blank every body line between the markers
+# (the long-blob rule alone misses the short final base64 line).
+redact_pem() { sed -E '/-----BEGIN [A-Z ]*PRIVATE KEY-----/,/-----END [A-Z ]*PRIVATE KEY-----/{/-----(BEGIN|END) /!s/.+/[REDACTED_PRIVATE_KEY_LINE]/}'; }
 redact_common() {
-  sed -E \
-    -e "s/((\"?)($SECRET_KEYS)(\"?)[[:space:]]*[:=][[:space:]]*\"?)[^\"[:space:]]+/\1[REDACTED]/Ig" \
+  redact_pem | sed -E \
+    -e "s/((\"?)($SECRET_KEYS)(\"?)[[:space:]]*[:=][[:space:]]*)\"[^\"]*\"/\1\"[REDACTED]\"/Ig" \
+    -e "s/((\"?)($SECRET_KEYS)(\"?)[[:space:]]*[:=][[:space:]]*)[^\"[:space:]].*/\1[REDACTED]/Ig" \
     -e 's/([Bb]earer )[A-Za-z0-9._~+/=-]{8,}/\1[REDACTED]/g' \
     -e 's#(://[^:/@[:space:]]+:)[^@/[:space:]]+@#\1[REDACTED]@#g' \
-    -e 's/AKIA[0-9A-Z]{16}/[REDACTED_AWS_KEY]/g'
+    -e 's/AKIA[0-9A-Z]{16}/[REDACTED_AWS_KEY]/g' \
+    -e 's/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/[REDACTED_JWT]/g'
 }
 # strict: config/env/inspect/compose/network-inspect -- also mask long base64/hex
 # blobs (GATEWAY_CONFIG payload, keys, certs run hundreds of chars).
 redact_strict() { redact_common | sed -E -e 's#[A-Za-z0-9+/_-]{40,}={0,2}#[REDACTED_LONG_TOKEN]#g'; }
-# logs: keyed secrets only (no long-blob masking) so debug content and the
-# base64 conversation/tube IDs we rely on stay readable.
-redact_logs() { redact_common; }
+# logs: mask only VERY long blobs (>=64) so base64 conversation/tube IDs
+# (~24-44 chars) stay readable, but a dumped config/key/cert still gets masked.
+redact_logs() { redact_common | sed -E -e 's#[A-Za-z0-9+/_-]{64,}={0,2}#[REDACTED_LONG_TOKEN]#g'; }
 
 # run CMD..., capture stdout+stderr to a file, never abort the script
 cap() { local f="$1"; shift; { echo "\$ $*"; "$@"; } >>"$f" 2>&1 || echo "(command failed, continuing)" >>"$f"; }
@@ -748,10 +753,12 @@ EOF
 echo
 echo "[*] Secret scan"
 SCAN="$OUT/REDACTION-SCAN.txt"
-grep -rinIE '(-----BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}|://[^:/@ ]+:[^@/ ]+@|(PASSWORD|PASSWD|PWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|PASSPHRASE|_SEED)"?[ ]*[:=][ ]*"?[^ ",}]{6,})' "$OUT" 2>/dev/null \
+# scan key list mirrors SECRET_KEYS so the defense-in-depth scan can catch a
+# redaction miss for ANY secret-shaped key (not a narrower subset).
+grep -rinIE '(-----BEGIN [A-Z ]*PRIVATE KEY|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{15,}\.[A-Za-z0-9_-]{15,}|://[^:/@ ]+:[^@/ ]+@|(GATEWAY_CONFIG|KCM_LICENSE|[A-Za-z0-9_]*(PASSWORD|PASSWD|PWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|PASSPHRASE|CREDENTIALS?|_KEY|_SEED|SEED))"?[ ]*[:=][ ]*"?[^ ",}]{6,})' "$OUT" 2>/dev/null \
   | grep -viE 'REDACTED' \
   | grep -vF 'REDACTION-SCAN.txt' > "$SCAN" 2>/dev/null || true
-RESID=$(grep -cE '.' "$SCAN" 2>/dev/null || echo 0)
+RESID=$(grep -cE '.' "$SCAN" 2>/dev/null); RESID=${RESID:-0}
 if [ "${RESID:-0}" -gt 0 ] 2>/dev/null; then
   note "WARN: secret-scan flagged ${RESID} line(s) that may be UNREDACTED -- open REDACTION-SCAN.txt and review/scrub before sharing"
 else

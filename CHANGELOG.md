@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.1.1
+Hardening from a multi-agent review pass.
+- **Redaction airtightness:** multi-line PEM private-key blocks now masked; values containing spaces (quoted or unquoted) masked in full (previously leaked after the first space); JWTs redacted; log path now masks very long (>=64 char) blobs while keeping conversation/tube IDs readable. PowerShell redaction brought to parity.
+- **Secret-scan parity:** scan key list now mirrors the full redaction key set (incl. `GATEWAY_CONFIG`/`KCM_LICENSE`/`CREDENTIAL`/`_KEY`/`_SEED`) and JWTs, on both bash and PowerShell.
+- **Bug fixes:** debug toggle no longer aborts under `set -u` on bash 3.2/4.3 when the compose `-f` list is empty (`${FARGS[@]+...}`); PowerShell reachability/target tests use a portable TCP probe instead of `Test-NetConnection` (which is absent on PS Core / Server Core and would mis-report BLOCKED); fixed a doubled secret-scan count; `--help` no longer truncates; PowerShell NTP check made best-effort (locale-tolerant).
+- **Docs:** README redaction section corrected (`KCM_LICENSE`, JWT/PEM, spaces) and `.env` wording clarified (container env values are captured redacted).
+
 ## v1.1.0
 - **Windows companion** `keeper-gateway-collect.ps1` (native-Windows gateway: service, Event Log, network, time sync, health endpoint, target reachability, redaction + secret-scan, `-Minimal`). Parse-validated; not yet live-validated on Windows.
 - **Time-skew WARN** (Linux): flags an unsynchronized clock (`timedatectl`/chrony/ntpq) — clock drift silently breaks TLS to the router/relay.
