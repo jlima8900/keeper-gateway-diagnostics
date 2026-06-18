@@ -1,0 +1,40 @@
+name: lint
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    name: shellcheck (bash)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck
+          shellcheck --version
+          # warning severity: ignore style/info noise; fail on real warnings+errors
+          shellcheck -S warning keeper-gateway-collect.sh
+      - name: bash syntax check
+        run: bash -n keeper-gateway-collect.sh
+
+  psscriptanalyzer:
+    name: PSScriptAnalyzer (PowerShell)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          # Excludes: WriteHost is intentional console output for this CLI tool;
+          # SingularNouns is style only (Protect-Secrets reads better plural).
+          $excl = @('PSAvoidUsingWriteHost','PSUseSingularNouns')
+          $r = Invoke-ScriptAnalyzer -Path ./keeper-gateway-collect.ps1 -Severity Warning,Error -ExcludeRule $excl
+          $r | Format-Table -AutoSize
+          if ($r) { Write-Error "PSScriptAnalyzer found $($r.Count) issue(s)"; exit 1 }
+          Write-Host "PSScriptAnalyzer clean"

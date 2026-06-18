@@ -126,7 +126,7 @@ try {
   if ($st -match 'not synchronized|0x800705B4|The service has not been started') {
     Note "WARN: Windows Time may not be synchronized (best-effort check) -- clock skew breaks TLS to the router/relay; verify 'w32tm /query /status'"
   }
-} catch {}
+} catch { Write-Verbose "w32tm time-sync check skipped: $_" }
 
 # ---- gateway service ------------------------------------------------------
 Write-Host "[*] Gateway service"

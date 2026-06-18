@@ -371,7 +371,6 @@ if have docker; then
     docker inspect "$CONTAINER" 2>/dev/null | redact_strict > "$OUT/docker/inspect.json"
     # key facts pulled out for the summary
     SHM=$(docker inspect "$CONTAINER" --format '{{.HostConfig.ShmSize}}' 2>/dev/null)
-    MEMLIM=$(docker inspect "$CONTAINER" --format '{{.HostConfig.Memory}}' 2>/dev/null)
     docker inspect "$CONTAINER" --format '{{json .HostConfig.SecurityOpt}}' 2>/dev/null > "$OUT/docker/security_opt.txt"
     docker inspect "$CONTAINER" --format '{{json .NetworkSettings.Networks}}' 2>/dev/null > "$OUT/docker/container_networks.txt"
     # full inspect of the gateway's network(s): subnet, gateway IP, driver, MTU --
