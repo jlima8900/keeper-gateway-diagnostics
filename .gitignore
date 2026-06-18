@@ -1,0 +1,11 @@
+# Diagnostic bundles produced by the collector — never commit captured data
+keeper-gw-diag-*/
+keeper-gw-diag-*.tar.gz
+
+# Compose override written by --enable-debug (in case it lands here)
+keeper-debug.override.yml
+
+# Editor / OS noise
+*.swp
+*.bak
+.DS_Store
