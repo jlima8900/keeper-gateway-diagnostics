@@ -251,6 +251,15 @@ if have vmstat; then
 fi
 have timedatectl && cap "$OUT/host/time.txt" timedatectl
 cap "$OUT/host/time.txt" date
+# clock skew silently breaks the TLS handshake to the router/relay -- WARN on it.
+SYNCED=""
+if have timedatectl; then
+  cap "$OUT/host/time.txt" sh -c 'timedatectl timesync-status 2>/dev/null'
+  SYNCED=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)
+fi
+have chronyc && cap "$OUT/host/time.txt" sh -c 'chronyc tracking 2>/dev/null'
+have ntpq && cap "$OUT/host/time.txt" sh -c 'ntpq -pn 2>/dev/null'
+[ "$SYNCED" = "no" ] && note "WARN: system clock is NOT NTP-synchronized -- clock skew breaks TLS to the router/relay; sync time (chronyd / systemd-timesyncd) before deeper debugging"
 
 # firewall snapshot (relevant to BOTH the VLAN/rotation routing class of issue
 # AND the WebRTC media-path class: a default-deny INPUT policy drops relayed
@@ -653,6 +662,31 @@ fi
 if [ "$MODE" = "docker" ] && [ -n "$CONTAINER" ]; then
   C6=$(docker exec "$CONTAINER" sh -c 'ip -6 addr show scope global 2>/dev/null | grep -c inet6' 2>/dev/null)
   echo "container global IPv6 addresses: ${C6:-0}" >> "$WF"
+fi
+
+# ---- rotation / discovery (host-side log evidence) ------------------------
+# Vault-side rotation status comes from Commander ('pam action job-info' /
+# 'service list') which needs vault auth -- this collector deliberately does NOT
+# run it (avoids a non-interactive keeper login). Here we parse the gateway log
+# for the rotation/discovery action signatures + their failures.
+echo "[*] Rotation / discovery (log)"
+if [ -n "${GWLOG:-}" ]; then
+  RF="$OUT/gateway/rotation.txt"
+  {
+    echo "Rotation/discovery activity in the collected log window:"
+    echo "  rotate-action lines : $(grep -cE 'rotate-action' "$GWLOG" 2>/dev/null)"
+    echo "  discover-action     : $(grep -cE 'discover-action' "$GWLOG" 2>/dev/null)"
+    echo "  kdnrm (rotation eng): $(grep -cE 'kdnrm' "$GWLOG" 2>/dev/null)"
+    echo "-- recent rotation/discovery lines (status + errors) --"
+    grep -iE 'rotate-action|discover-action|kdnrm|job-info-action' "$GWLOG" 2>/dev/null \
+      | grep -iE 'ERROR|WARN|fail|exception|denied|timeout|unreachable|refused|started|completed|success' | tail -30
+  } > "$RF"
+  RERR=$(grep -ciE '(rotate-action|discover-action|kdnrm).*(ERROR|fail|exception|denied|timeout|unreachable|refused)' "$GWLOG" 2>/dev/null)
+  if [ "${RERR:-0}" -gt 0 ] 2>/dev/null; then
+    note "NOTE: ${RERR} rotation/discovery error line(s) in the log -- see gateway/rotation.txt (vault-side status: run 'pam action job-info' in Commander)"
+  fi
+else
+  echo "(no gateway log available to parse for rotation activity)" > "$OUT/gateway/rotation.txt"
 fi
 
 # ---- debug how-to (printed, never auto-applied) ---------------------------

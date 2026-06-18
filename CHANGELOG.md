@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.1.0
+- **Windows companion** `keeper-gateway-collect.ps1` (native-Windows gateway: service, Event Log, network, time sync, health endpoint, target reachability, redaction + secret-scan, `-Minimal`). Parse-validated; not yet live-validated on Windows.
+- **Time-skew WARN** (Linux): flags an unsynchronized clock (`timedatectl`/chrony/ntpq) — clock drift silently breaks TLS to the router/relay.
+- **Rotation/discovery log analysis** (Linux): parses gateway logs for `rotate-action`/`discover-action`/`kdnrm` activity + errors → `gateway/rotation.txt` (vault-side status still needs Commander `pam action job-info`).
+- Podman code path validated end-to-end (shim over the real engine).
+
 ## v1.0.0
 Initial release — read-only KeeperPAM Gateway diagnostic collector.
 

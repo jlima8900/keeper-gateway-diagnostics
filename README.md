@@ -4,6 +4,8 @@ A read-only diagnostic data collector for a **KeeperPAM Gateway** host. It gathe
 
 It is **runtime-agnostic** (Docker **or** Podman), **distro-aware** (RHEL/Rocky/CentOS/Fedora *and* Debian/Ubuntu), and degrades gracefully when diagnostic tools are missing — so it runs and produces a useful bundle almost anywhere.
 
+A **Windows** companion, [`keeper-gateway-collect.ps1`](keeper-gateway-collect.ps1), covers native-Windows gateway installs (service status, Event Log, network, time sync, health endpoint, target reachability). It is syntax/parse-validated but **not yet validated on a live Windows gateway** — review its output and please report issues.
+
 > Collection is **read-only**. The only state-changing actions are the explicit, opt-in `--enable-debug` / `--disable-debug` toggles, which write/remove a Compose **override** file (your real `docker-compose.yml` is never edited) and recreate only the gateway service.
 
 ## Quick start
@@ -22,6 +24,13 @@ chmod +x keeper-gateway-collect.sh
 ```
 
 The result is a directory plus a `.tar.gz` next to it. **Review it before sharing.**
+
+On **Windows** (PowerShell, run as Administrator):
+
+```powershell
+.\keeper-gateway-collect.ps1 -Region us
+.\keeper-gateway-collect.ps1 -Target dc01.corp.local:5986 -Minimal   # WinRM rotation target
+```
 
 ## Issue classes it covers
 
