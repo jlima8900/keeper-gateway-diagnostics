@@ -130,7 +130,9 @@ try {
 
 # ---- gateway service ------------------------------------------------------
 Write-Host "[*] Gateway service"
-$svc = Get-Service 2>$null | Where-Object { $_.Name -match 'keeper' -or $_.DisplayName -match 'Keeper.*Gateway' }
+# match the PAM gateway service specifically -- NOT every "keeper" service
+# (EPM / KeeperWatchdog contain "keeper" but are not the gateway).
+$svc = Get-Service 2>$null | Where-Object { $_.Name -match 'gateway' -or $_.DisplayName -match '(Keeper|PAM).*Gateway' }
 if ($svc) {
   Cap (Join-Path $out 'service\service.txt') { $svc | Format-List Name,DisplayName,Status,StartType }
   foreach ($s in $svc) {

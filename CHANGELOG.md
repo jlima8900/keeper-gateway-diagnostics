@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.1.2
+- **Windows collector live-validated** on Windows Server 2022 (runs to completion, redacts, produces a `.zip` bundle).
+- **Fix:** gateway-service detection no longer false-matches non-gateway Keeper services (EPM / KeeperWatchdog) — now matches gateway-named services only. Found by the live run.
+
 ## v1.1.1
 Hardening from a multi-agent review pass.
 - **Redaction airtightness:** multi-line PEM private-key blocks now masked; values containing spaces (quoted or unquoted) masked in full (previously leaked after the first space); JWTs redacted; log path now masks very long (>=64 char) blobs while keeping conversation/tube IDs readable. PowerShell redaction brought to parity.

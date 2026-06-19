@@ -4,7 +4,7 @@ A read-only diagnostic data collector for a **KeeperPAM Gateway** host. It gathe
 
 It is **runtime-agnostic** (Docker **or** Podman), **distro-aware** (RHEL/Rocky/CentOS/Fedora *and* Debian/Ubuntu), and degrades gracefully when diagnostic tools are missing — so it runs and produces a useful bundle almost anywhere.
 
-A **Windows** companion, [`keeper-gateway-collect.ps1`](keeper-gateway-collect.ps1), covers native-Windows gateway installs (service status, Event Log, network, time sync, health endpoint, target reachability). It is syntax/parse-validated but **not yet validated on a live Windows gateway** — review its output and please report issues.
+A **Windows** companion, [`keeper-gateway-collect.ps1`](keeper-gateway-collect.ps1), covers native-Windows gateway installs (service status, Event Log, network, time sync, health endpoint, target reachability). It is **live-validated on Windows Server 2022** (runs to completion, redacts, and produces a `.zip` bundle); the gateway-service section is exercised against a real gateway when one is available.
 
 > Collection is **read-only**. The only state-changing actions are the explicit, opt-in `--enable-debug` / `--disable-debug` toggles, which write/remove a Compose **override** file (your real `docker-compose.yml` is never edited) and recreate only the gateway service.
 
