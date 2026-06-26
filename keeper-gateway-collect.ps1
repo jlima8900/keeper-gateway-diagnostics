@@ -216,7 +216,7 @@ if (-not $NoNetwork) {
     if (@($v6).Count -gt 0 -and $v6global.Count -eq 0) {
       Note "WARN: host has IPv6 enabled but NO global IPv6 address (link-local only -- typical of Hyper-V VMs). The gateway will fail STUN/TURN over IPv6 to $Relay and may gather no relay candidate. Disable IPv6 on the host (or force IPv4), then retry a session."
     }
-  } catch {}
+  } catch { $null = $_ }  # best-effort: skip hosts where IPv6 enumeration isn't available
   # TLS cert of the router
   try {
     $tcp = [System.Net.Sockets.TcpClient]::new($Router, 443)
