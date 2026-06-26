@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.0
+- **WebRTC/ICE media-path analysis (new):** scans the collected gateway logs and reports why a session fails, separating look-alike causes — ICE never reached `connected` + "no candidate pairs" (never paired), `srflx` gathered but **no relay (TURN) candidate** (relay path never established), **relay candidates on both sides yet no pair** (TURN allocates but a proxy/SWG strips the UDP media), and `could not listen udp fe80::` (host link-local-only IPv6). Writes `network/webrtc-ice-analysis.txt` + targeted WARN notes. Treats `failed to resolve stun host … No available ipv6` as expected noise (the relay has no native IPv6), not a host defect.
+- **Relay path probes (new):** UDP/STUN probe to `krelay…:3478` (STUN/TURN is UDP — a TCP-open does not prove the media path) + an AAAA (IPv6) resolution check for the relay.
+- **Host IPv6 health (new):** flags IPv6 enabled with **no global address (link-local only — typical of Hyper-V VMs)**.
+- **Bash + PowerShell parity:** all three checks are in both collectors; the PowerShell additions are live-validated on **Windows Server 2022 (PowerShell 5.1)** against the live relay.
+
 ## v1.1.2
 - **Windows collector live-validated** on Windows Server 2022 (runs to completion, redacts, produces a `.zip` bundle).
 - **Fix:** gateway-service detection no longer false-matches non-gateway Keeper services (EPM / KeeperWatchdog) — now matches gateway-named services only. Found by the live run.

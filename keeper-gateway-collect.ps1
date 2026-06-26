@@ -183,6 +183,40 @@ if (-not $NoNetwork) {
     Add-Content $rf ("TCP {0}:{1} -> {2}" -f $hp[0], $hp[1], $(if ($ok){'OPEN'}else{'BLOCKED'}))
     if (-not $ok) { Note "WARN: $($hp[0]):$($hp[1]) not reachable" }
   }
+  # AAAA (IPv6) resolution of the relay -- cross-reference the host IPv6 check below.
+  try {
+    $aaaa = (Resolve-DnsName $Relay -Type AAAA -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -Expand IPAddress) -join ','
+    Add-Content $rf "DNS(AAAA) $Relay -> $(if ($aaaa){$aaaa}else{'none'})"
+  } catch { Add-Content $rf "DNS(AAAA) $Relay -> none/failed" }
+  # STUN over UDP -- a response proves the media path is open. A TCP-open on 3478 does
+  # NOT (STUN/TURN is UDP). Send a real STUN Binding Request and wait briefly for a reply.
+  try {
+    $udp = [System.Net.Sockets.UdpClient]::new()
+    $udp.Client.ReceiveTimeout = 3000
+    $udp.Connect($Relay, 3478)
+    $txid = [byte[]]::new(12); (New-Object Random).NextBytes($txid)
+    # cast the WHOLE concat to byte[] -- @(...) + $txid yields Object[], which Send() rejects
+    $req  = [byte[]](@(0x00,0x01,0x00,0x00, 0x21,0x12,0xA4,0x42) + $txid)  # STUN Binding Request
+    [void]$udp.Send($req, $req.Length)
+    $ep   = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+    $resp = $udp.Receive([ref]$ep)
+    Add-Content $rf "UDP $Relay:3478 (STUN) -> response received ($($resp.Length) bytes) = reachable"
+    $udp.Close()
+  } catch {
+    Add-Content $rf "UDP $Relay:3478 (STUN) -> no response"
+    Note "WARN: no STUN response from $Relay:3478 over UDP -- STUN/TURN is UDP. A firewall allowing TCP 3478 but dropping UDP 3478 (+ the 49152-65535 range) yields 'no relay candidate / session never connects'. Verify outbound UDP to $Relay."
+  }
+  # Host IPv6 health: enabled but NO global address (link-local only -- common on
+  # Hyper-V VMs) makes the gateway fail STUN/TURN over IPv6 and gather no relay candidate.
+  try {
+    $v6 = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+      ForEach-Object { $_.GetIPProperties().UnicastAddresses } |
+      Where-Object { $_.Address.AddressFamily -eq 'InterNetworkV6' }
+    $v6global = @($v6 | Where-Object { -not $_.Address.IsIPv6LinkLocal })
+    if (@($v6).Count -gt 0 -and $v6global.Count -eq 0) {
+      Note "WARN: host has IPv6 enabled but NO global IPv6 address (link-local only -- typical of Hyper-V VMs). The gateway will fail STUN/TURN over IPv6 to $Relay and may gather no relay candidate. Disable IPv6 on the host (or force IPv4), then retry a session."
+    }
+  } catch {}
   # TLS cert of the router
   try {
     $tcp = [System.Net.Sockets.TcpClient]::new($Router, 443)
@@ -238,6 +272,45 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
     Cap (Join-Path $out 'docker\logs.txt') -Redact { docker logs --tail 2000 $gw }
     Note "gateway container (Docker Desktop): $gw"
   }
+}
+
+# ---- WebRTC / ICE media-path analysis -------------------------------------
+# Scan the collected gateway logs for the ICE/relay failure signatures that decide
+# WHY a session fails -- separating "never paired", "no relay candidate (TURN
+# allocation failing)", "host IPv6 starving relay", and "remote side host-only too".
+$glog = Join-Path $out 'docker\logs.txt'
+if (Test-Path $glog) {
+  Write-Host "[*] WebRTC / ICE analysis"
+  $L = Get-Content $glog -Raw
+  function Cnt([string]$re) { ([regex]::Matches($L, $re)).Count }
+  $iceFail = Cnt 'connection state changed: failed|ICE connection failed'
+  $iceOk   = Cnt 'connection state changed: (connected|completed)|selected candidate pair|nominated pair'
+  $noPairs = Cnt 'pingAllCandidates called with no candidate pairs'
+  $v6res   = Cnt 'failed to resolve stun host.*No available ipv6 IP address'
+  $v6bind  = Cnt 'could not listen udp fe80'
+  $lrelay  = Cnt 'udp[46] relay |Local ICE candidate.*typ=relay'
+  $lsrflx  = Cnt 'udp[46] srflx |Local ICE candidate.*typ=srflx'
+  $rrelay  = Cnt 'Remote ICE candidate.*typ=relay'
+  $rhost   = Cnt 'Remote ICE candidate.*typ=host'
+  @(
+    "== WebRTC / ICE media-path analysis ==",
+    "ICE sessions failed                  : $iceFail",
+    "ICE reached connected/selected pair  : $iceOk",
+    "pingAllCandidates: no candidate pairs: $noPairs",
+    "IPv6 relay-resolve failures (krelay) : $v6res",
+    "IPv6 link-local bind failures (fe80) : $v6bind",
+    "LOCAL  relay (TURN) candidates        : $lrelay",
+    "LOCAL  srflx candidates               : $lsrflx",
+    "REMOTE relay (TURN) candidates        : $rrelay",
+    "REMOTE host candidates                : $rhost"
+  ) | Set-Content (Join-Path $out 'network\webrtc-ice-analysis.txt')
+  if ($iceFail -gt 0 -and $iceOk -eq 0) { Note "WARN: WebRTC ICE never reached 'connected' ($iceFail failed / 0 connected) -- sessions not establishing at all, NOT a mid-session drop (network/webrtc-ice-analysis.txt)" }
+  if ($noPairs -gt 0) { Note "WARN: ICE logged 'no candidate pairs' x$noPairs -- the two sides never produced a usable candidate pair (relay/NAT path problem)" }
+  if ($lrelay -eq 0 -and $lsrflx -gt 0) { Note "WARN: gateway gathered srflx but NO relay (TURN) candidate -- could not allocate a relay on $Relay:3478; verify UDP 3478 + a TURN allocation (not just TCP/STUN) and the host IPv6 note. (Cause class: relay path never established.)" }
+  if ($lrelay -gt 0 -and $rrelay -gt 0 -and $iceOk -eq 0) { Note "WARN: relay (TURN) candidates gathered on BOTH sides yet NO pair connected -- TURN allocates but the relayed UDP media/connectivity-checks are being dropped. Classic of a cloud proxy / SWG (e.g. Zscaler) or UDP stripped between relay and peer. Verify UDP is not proxied/filtered end-to-end (a TCP 'open' on 3478 does not prove this). (Cause class: relay allocates but media blocked, NOT a missing relay.)" }
+  if ($v6bind -gt 0) { Note "WARN: gateway failed to bind an IPv6 interface ('could not listen udp fe80::' x$v6bind) -- the host has link-local-only IPv6 (typical of Hyper-V VMs) that the ICE agent tries and fails to use. Disable IPv6 on the host or force IPv4 for $Relay, then retry." }
+  if ($v6res -gt 0) { Note "NOTE: ${v6res}x 'failed to resolve stun host ... No available ipv6' -- EXPECTED noise ($Relay publishes no native IPv6/AAAA, only IPv4-mapped), NOT a host defect on its own; do not chase it." }
+  if ($rrelay -eq 0 -and $rhost -gt 0) { Note "NOTE: the REMOTE (client) side also offered NO relay candidate (host-only) -- the missing relay path is on BOTH ends; check the client/viewer network too, not only the gateway." }
 }
 
 # ---- collection notice + secret scan + zip --------------------------------

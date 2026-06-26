@@ -1,10 +1,10 @@
 # keeper-gateway-diagnostics
 
-A read-only diagnostic data collector for a **KeeperPAM Gateway** host. It gathers host, container, gateway/guacd, network, WebRTC media-path, and RBI/CEF state into a single **redacted** `.tar.gz` bundle you can attach to a support case.
+A read-only diagnostic data collector for a **KeeperPAM Gateway** host. It gathers host, container, gateway/guacd, network, WebRTC media-path (with **ICE candidate-type root-cause analysis**), and RBI/CEF state into a single **redacted** `.tar.gz` bundle you can attach to a support case.
 
 It is **runtime-agnostic** (Docker **or** Podman), **distro-aware** (RHEL/Rocky/CentOS/Fedora *and* Debian/Ubuntu), and degrades gracefully when diagnostic tools are missing — so it runs and produces a useful bundle almost anywhere.
 
-A **Windows** companion, [`keeper-gateway-collect.ps1`](keeper-gateway-collect.ps1), covers native-Windows gateway installs (service status, Event Log, network, time sync, health endpoint, target reachability). It is **live-validated on Windows Server 2022** (runs to completion, redacts, and produces a `.zip` bundle); the gateway-service section is exercised against a real gateway when one is available.
+A **Windows** companion, [`keeper-gateway-collect.ps1`](keeper-gateway-collect.ps1), covers native-Windows gateway installs (service status, Event Log, network, time sync, health endpoint, target reachability) and is at **feature parity** with the bash collector — including the UDP/STUN relay probe, AAAA + host link-local-IPv6 checks, and the WebRTC/ICE candidate-type analysis below. It is **live-validated on Windows Server 2022 (PowerShell 5.1)** (runs to completion, redacts, and produces a `.zip` bundle); the new probes were validated against the live relay.
 
 > Collection is **read-only**. The only state-changing actions are the explicit, opt-in `--enable-debug` / `--disable-debug` toggles, which write/remove a Compose **override** file (your real `docker-compose.yml` is never edited) and recreate only the gateway service.
 
@@ -38,11 +38,26 @@ On **Windows** (PowerShell, run as Administrator):
 |---|---|
 | Control plane | router/relay/cloud reachability, TLS issuer+expiry, time sync, gateway HTTP health endpoint (websocket latency, `under_pressure`, `can_accept_rbi`) |
 | WebRTC "drops" | host INPUT policy + RELATED,ESTABLISHED rule, `nf_conntrack_udp_timeout`, live conntrack-to-relay, ICE connected/disconnected/failed ratio |
-| WebRTC "slow" | ICE candidate types (relay vs direct), relay RTT, IPv6 STUN-failure count, container IPv6 presence |
+| WebRTC "never connects" | **ICE candidate-type root-cause analysis** (see below): no-relay-candidate vs relay-on-both-sides-but-blocked, never-paired detection, host link-local-IPv6 |
+| WebRTC reachability | TCP **and UDP/STUN** probe to the relay (STUN/TURN is UDP — a TCP "open" doesn't prove it), AAAA lookup, host IPv6 health |
 | RBI/DB black screen or slow | `/dev/shm` size vs RAM, Chromium/CEF lifecycle, distro-aware LSM audit — **SELinux** (`getenforce`, AVC) or **AppArmor** (`aa-status`, denials) + seccomp |
 | Rotation/target | DNS + TCP from inside the gateway container (`--target`) |
 | Performance | CPU steal, load, per-container stats, kernel entropy |
 | Local network | host interfaces/routes/DNS, NAT table, listening sockets, `docker network inspect` (subnet/MTU) |
+
+## WebRTC / ICE media-path analysis
+
+When the gateway logs are at `debug`, the collector scans them and writes `network/webrtc-ice-analysis.txt` — a **candidate-type breakdown** that turns the same user-visible symptom ("can't connect" / "drops after ~30s") into a *specific* root cause. It classifies ICE candidates as **local** (the gateway) vs **remote** (the client) and raises targeted findings:
+
+| Signature in the log | What it means | Where to look |
+|---|---|---|
+| Never reaches `connected` + `pingAllCandidates ... no candidate pairs` | ICE never paired — it **never connected**, not a mid-session drop | candidate/relay/NAT — *not* a conntrack timeout |
+| Gateway gathered `srflx` but **no relay (TURN) candidate** | the relay path was never established | gateway can't allocate TURN — check **outbound UDP 3478 + 49152–65535**, and host IPv6 below |
+| Relay candidates on **both** sides yet no pair connects | TURN allocates but the relayed **UDP media** is dropped | a cloud proxy / **SWG** (e.g. Zscaler) stripping WebRTC UDP — a TCP "open" on 3478 does *not* prove the path |
+| `could not listen udp fe80::` (bind failure) | host has **link-local-only IPv6** (typical of Hyper-V VMs) | disable IPv6 on the host or force IPv4, then retry |
+| `failed to resolve stun host … No available ipv6` | **expected noise** — `krelay` publishes no native IPv6 (AAAA is IPv4-mapped) | ignore — it appears on healthy gateways too; not a host defect |
+
+These map two common-but-different failures apart: a host that **never builds a relay path** (no TURN candidate — usually blocked UDP or broken host IPv6) versus a path where **TURN allocates but a middlebox strips the UDP media** (relay on both sides, still no pair). The reachability section adds matching active probes: a **UDP/STUN** check to `krelay:3478`, an **AAAA** lookup, and a **host link-local-IPv6** check.
 
 ## Options
 

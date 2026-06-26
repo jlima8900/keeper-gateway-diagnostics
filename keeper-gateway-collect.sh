@@ -309,6 +309,19 @@ have conntrack && { echo "count=$(cat /proc/sys/net/netfilter/nf_conntrack_count
 have ip && ip -6 route show default 2>/dev/null | grep -q . \
   && note "host has an IPv6 default route (dual-stack); Keeper relay candidates are IPv4 -- watch for ICE asymmetry"
 
+# IPv6 enabled but with NO usable GLOBAL address (link-local only) -- common on
+# Hyper-V VMs -- makes the ICE agent try STUN/TURN over IPv6 and fail to resolve/bind
+# ("No available ipv6 IP address" / "could not listen udp fe80::"), starving relay
+# gathering so NO relay (TURN) candidate is produced. It looks like a firewall
+# problem but is host-side. (Seen live: Hyper-V gateway, sessions never connected.)
+if have ip; then
+  V6GLOBAL=$(ip -6 addr show scope global 2>/dev/null | grep -c 'inet6')
+  V6ANY=$(ip -6 addr show 2>/dev/null | grep -c 'inet6')
+  if [ "${V6GLOBAL:-0}" -eq 0 ] && [ "${V6ANY:-0}" -gt 0 ]; then
+    note "WARN: host has IPv6 enabled but NO global IPv6 address (link-local only -- typical of Hyper-V VMs). The gateway will fail STUN/TURN over IPv6 to $RELAY and may gather no relay candidate. Disable IPv6 on the host (or force IPv4 for $RELAY), then retry a session."
+  fi
+fi
+
 # ---- host local network config (network-class troubleshooting; runs even
 # with --no-network since it is all local state, no egress) -----------------
 HN="$OUT/network/host-network.txt"
@@ -448,6 +461,63 @@ else
   note "could not locate gateway logs automatically; check deployment mode"
 fi
 
+# ---- WebRTC / ICE media-path analysis -------------------------------------
+# Scan the just-collected gateway logs for the ICE/relay failure signatures that
+# decide WHY a session fails. The same user-visible symptom ("can't connect" /
+# "drops after ~30s") has very different causes -- this separates them:
+#   * never reaches 'connected' + "no candidate pairs"  -> ICE never paired
+#   * srflx gathered but NO relay candidate             -> TURN allocation failing
+#   * IPv6 resolve/bind failures to the relay           -> host IPv6 starving relay
+#   * remote side also host-only (no relay)             -> problem is on BOTH ends
+GLOG=""
+for c in "$OUT/gateway/container-logs.txt" "$OUT/gateway/journal.txt"; do
+  [ -s "$c" ] && GLOG="$GLOG $c"
+done
+if [ -n "$GLOG" ]; then
+  echo "[*] WebRTC / ICE analysis"
+  WA="$OUT/network/webrtc-ice-analysis.txt"
+  wcm() { grep -hcE "$1" $GLOG 2>/dev/null | awk '{s+=$1} END{print s+0}'; } # sum matches across logs
+  ICE_FAIL=$(wcm 'connection state changed: failed|ICE connection failed')
+  ICE_OK=$(wcm 'connection state changed: (connected|completed)|selected candidate pair|nominated pair')
+  NOPAIRS=$(wcm 'pingAllCandidates called with no candidate pairs')
+  V6RES=$(wcm 'failed to resolve stun host.*No available ipv6 IP address')
+  V6BIND=$(wcm 'could not listen udp fe80')
+  LRELAY=$(wcm 'udp[46] relay |Local ICE candidate.*typ=relay')
+  LSRFLX=$(wcm 'udp[46] srflx |Local ICE candidate.*typ=srflx')
+  RRELAY=$(wcm 'Remote ICE candidate.*typ=relay')
+  RHOST=$(wcm 'Remote ICE candidate.*typ=host')
+  {
+    echo "== WebRTC / ICE media-path analysis =="
+    echo "(scanned:$GLOG)"
+    echo
+    echo "ICE sessions failed                  : $ICE_FAIL"
+    echo "ICE reached connected/selected pair  : $ICE_OK"
+    echo "pingAllCandidates: no candidate pairs: $NOPAIRS"
+    echo "IPv6 relay-resolve failures (krelay) : $V6RES"
+    echo "IPv6 link-local bind failures (fe80) : $V6BIND"
+    echo "LOCAL  relay (TURN) candidates        : $LRELAY"
+    echo "LOCAL  srflx candidates               : $LSRFLX"
+    echo "REMOTE relay (TURN) candidates        : $RRELAY"
+    echo "REMOTE host candidates                : $RHOST"
+  } > "$WA"
+  if [ "$ICE_FAIL" -gt 0 ] && [ "$ICE_OK" -eq 0 ]; then
+    note "WARN: WebRTC ICE never reached 'connected' (${ICE_FAIL} failed / 0 connected) -- sessions are not establishing at all, NOT a mid-session drop (see network/webrtc-ice-analysis.txt)"
+  fi
+  [ "$NOPAIRS" -gt 0 ] && note "WARN: ICE logged 'no candidate pairs' x${NOPAIRS} -- the two sides never produced a usable candidate pair (relay/NAT path problem)"
+  if [ "$LRELAY" -eq 0 ] && [ "$LSRFLX" -gt 0 ]; then
+    note "WARN: gateway gathered srflx but NO relay (TURN) candidate -- it could not allocate a relay on $RELAY:3478. Verify UDP 3478 + a TURN allocation outbound (not just TCP/STUN), and check the host IPv6 note above. (Cause class: relay path never established.)"
+  fi
+  if [ "$LRELAY" -gt 0 ] && [ "$RRELAY" -gt 0 ] && [ "$ICE_OK" -eq 0 ]; then
+    note "WARN: relay (TURN) candidates were gathered on BOTH sides yet NO pair connected -- TURN allocation works but the relayed UDP media/connectivity-checks are being dropped. Classic of a cloud proxy / SWG (e.g. Zscaler) or UDP stripped between the relay and the peer. Verify UDP is not proxied/filtered end-to-end -- a TCP 'open' on 3478 does not prove this. (Cause class: relay allocates but media blocked, NOT a missing relay.)"
+  fi
+  if [ "$V6BIND" -gt 0 ]; then
+    note "WARN: gateway failed to bind an IPv6 interface ('could not listen udp fe80::' x${V6BIND}) -- the host has link-local-only IPv6 (typical of Hyper-V VMs) that the ICE agent tries and fails to use. Disable IPv6 on the host or force IPv4 for $RELAY, then retry."
+  fi
+  [ "$V6RES" -gt 0 ] && note "NOTE: ${V6RES}x 'failed to resolve stun host ... No available ipv6' -- EXPECTED noise ($RELAY publishes no native IPv6/AAAA, only IPv4-mapped), NOT a host defect on its own; do not chase it."
+  [ "$RRELAY" -eq 0 ] && [ "$RHOST" -gt 0 ] && note "NOTE: the REMOTE (client) side also offered NO relay candidate (host-only) -- the missing relay path is on BOTH ends; check the client/viewer network too, not only the gateway."
+  echo "  -> network/webrtc-ice-analysis.txt"
+fi
+
 # ---- RBI specifics --------------------------------------------------------
 echo "[*] RBI / Chromium"
 if [ "$MODE" = "docker" ] && [ -n "$CONTAINER" ]; then
@@ -557,14 +627,30 @@ if [ "$DO_NET" = "yes" ]; then
     if have nc; then timeout "$TIMEOUT" nc -z -w "$TIMEOUT" "$1" "$2" >/dev/null 2>&1; return $?; fi
     timeout "$TIMEOUT" bash -c "exec 3<>/dev/tcp/$1/$2" >/dev/null 2>&1; return $?
   }
+  udp_probe() { # host port -- best-effort: UDP is connectionless, so a "reachable"
+    # only means the datagram left and no ICMP port-unreachable came back. Needs nc.
+    have nc && timeout "$TIMEOUT" nc -u -z -w "$TIMEOUT" "$1" "$2" >/dev/null 2>&1
+  }
   for h in "$ROUTER" "$RELAY" "$CLOUD"; do
     if have getent; then echo "DNS $h -> $(getent ahosts "$h" | awk '{print $1}' | sort -u | paste -sd, -)" >> "$NF"
     else echo "DNS $h -> (getent unavailable)" >> "$NF"; fi
   done
+  # Does the relay resolve over IPv6 (AAAA)? If the gateway prefers IPv6 but the host
+  # has no usable global IPv6, gathering fails -- cross-reference the host IPv6 note.
+  if have getent; then echo "DNS(AAAA) $RELAY -> $(getent ahostsv6 "$RELAY" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd, - || echo none)" >> "$NF"; fi
   for hp in "$ROUTER:443" "$CLOUD:443" "$RELAY:3478"; do
     h="${hp%:*}"; p="${hp##*:}"
     if tcp_probe "$h" "$p"; then echo "TCP $h:$p OPEN" >> "$NF"; else echo "TCP $h:$p BLOCKED" >> "$NF"; note "WARN: $h:$p not reachable"; fi
   done
+  # STUN/TURN is UDP -- a TCP-open on 3478 does NOT prove the media path. Probe UDP too.
+  if have nc; then
+    if udp_probe "$RELAY" 3478; then echo "UDP $RELAY:3478 (STUN/TURN) reachable (best-effort)" >> "$NF"
+    else echo "UDP $RELAY:3478 (STUN/TURN) BLOCKED or no response (best-effort)" >> "$NF"
+      note "WARN: UDP 3478 to $RELAY appears blocked / no response. STUN/TURN is UDP -- a firewall that allows TCP 3478 but drops UDP 3478 (and the relay range) yields 'no relay candidate / session never connects'. Confirm UDP 3478 + 49152-65535 outbound to $RELAY."
+    fi
+  else
+    echo "UDP $RELAY:3478 -- skipped (nc not installed; UDP probe needs nc)" >> "$NF"
+  fi
   if have openssl; then
     echo | timeout "$TIMEOUT" openssl s_client -connect "${ROUTER}:443" -servername "$ROUTER" 2>/dev/null \
       | openssl x509 -noout -issuer -dates 2>/dev/null >> "$NF" || echo "TLS check to $ROUTER failed" >> "$NF"
