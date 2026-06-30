@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.3.0
+- **Active STUN binding probe (new):** sends a real RFC 5389 binding request to the relay and waits for the binding *response*, then decodes XOR-MAPPED-ADDRESS to recover the server-reflexive (`srflx`) address. This is the **definitive** UDP/3478 test — it supersedes the best-effort `nc -u -z` / `/dev/udp` checks, which can't distinguish an open path from a silently-filtered one (a STUN server ignores non-STUN bytes, so "sent OK / 0 received" looks identical either way). A returned `srflx` proves a direct (non-relay) media path is reachable; no response means UDP/3478 egress is blocked — the usual cause of relay-only "slow RBI".
+- **Container-namespace probe (new):** runs the STUN probe inside the container's network namespace via `nsenter` using the *host's* python3, so the real container egress is tested even on minimal images that ship no python3; falls back to `docker exec` then to a clear skip note.
+- **`KEEPER_GATEWAY_TUNNEL_ONLY_USE_TURN` detection (new):** when set, relay-only media is *intentional config*, not a NAT/firewall fault — flagged up front and cross-referenced in the candidate-type note so it isn't misdiagnosed.
+- **`KRELAY_SERVER` override honored (new):** reads the gateway env and points the STUN probe + conntrack grep at the relay actually in use rather than the region default.
+- **DEBUG-HOWTO:** documents `KEEPER_GATEWAY_INCLUDE_WEBRTC_LOGS=1`, required for the ICE candidate-type lines the WebRTC analysis parses to appear.
+- Bash collector only; PowerShell parity for these checks is a follow-up (the STUN binding probe + netns entry need a Windows-side design and live validation).
+
 ## v1.2.0
 - **WebRTC/ICE media-path analysis (new):** scans the collected gateway logs and reports why a session fails, separating look-alike causes — ICE never reached `connected` + "no candidate pairs" (never paired), `srflx` gathered but **no relay (TURN) candidate** (relay path never established), **relay candidates on both sides yet no pair** (TURN allocates but a proxy/SWG strips the UDP media), and `could not listen udp fe80::` (host link-local-only IPv6). Writes `network/webrtc-ice-analysis.txt` + targeted WARN notes. Treats `failed to resolve stun host … No available ipv6` as expected noise (the relay has no native IPv6), not a host defect.
 - **Relay path probes (new):** UDP/STUN probe to `krelay…:3478` (STUN/TURN is UDP — a TCP-open does not prove the media path) + an AAAA (IPv6) resolution check for the relay.

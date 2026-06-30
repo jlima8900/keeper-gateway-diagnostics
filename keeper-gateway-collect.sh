@@ -686,6 +686,30 @@ echo "[*] WebRTC / media path"
 WF="$OUT/network/webrtc.txt"
 : > "$WF"
 
+# Gateway env can change BOTH the relay target and whether a direct path is even
+# attempted -- read it first, or we probe the wrong host / misread the result.
+GW_ENV=""
+if [ "$MODE" = "docker" ] && [ -n "$CONTAINER" ]; then
+  GW_ENV="$(docker inspect "$CONTAINER" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null)"
+fi
+# KRELAY_SERVER overrides the relay host -- honor it so the STUN probe + conntrack
+# grep target the relay actually in use, not the region default.
+KRELAY_OVR="$(printf '%s\n' "$GW_ENV" | grep -i '^KRELAY_SERVER=' | head -1 | cut -d= -f2- | tr -d '"')"
+if [ -n "$KRELAY_OVR" ]; then
+  echo "relay host overridden by KRELAY_SERVER env: $KRELAY_OVR (region default was $RELAY)" >> "$WF"
+  note "NOTE: KRELAY_SERVER override in effect -- relay is $KRELAY_OVR, not the $REGION default; all media tests below probe the override"
+  RELAY="$KRELAY_OVR"
+fi
+# KEEPER_GATEWAY_TUNNEL_ONLY_USE_TURN forces relay-only media REGARDLESS of STUN/NAT.
+# If set, the relay path is a deliberate config choice, not a network fault -- this
+# is the first thing to check when "RBI/RDP is slow" and ICE shows relay-only.
+TURN_ONLY="$(printf '%s\n' "$GW_ENV" | grep -i '^KEEPER_GATEWAY_TUNNEL_ONLY_USE_TURN=' | head -1 | cut -d= -f2- | tr -d '"')"
+case "$(printf '%s' "${TURN_ONLY:-}" | tr 'A-Z' 'a-z')" in
+  1|true|yes|on)
+    echo "KEEPER_GATEWAY_TUNNEL_ONLY_USE_TURN=$TURN_ONLY -- media forced onto the TURN relay by config" >> "$WF"
+    note "KEY: KEEPER_GATEWAY_TUNNEL_ONLY_USE_TURN is ENABLED -- relay-only media is INTENTIONAL config, not a NAT/firewall problem. Unset it to allow direct (srflx/host) candidates and lower latency." ;;
+esac
+
 # relay IPs (used to grep conntrack + as the UDP egress target)
 RELAY_IPS=""
 have getent && RELAY_IPS="$(getent ahosts "$RELAY" 2>/dev/null | awk '{print $1}' | sort -u)"
@@ -698,6 +722,94 @@ if [ "$MODE" = "docker" ] && [ -n "$CONTAINER" ] && [ "$DO_NET" = "yes" ]; then
   # UDP 3478 egress to the relay from inside the container
   docker exec "$CONTAINER" sh -c "timeout 5 bash -c 'echo > /dev/udp/${RELAY}/3478' 2>/dev/null && echo SENT || echo FAIL" 2>/dev/null \
     | { read -r r; echo "UDP 3478 -> $RELAY from container: ${r:-FAIL}" >> "$WF"; }
+fi
+
+# active STUN binding probe -- the DEFINITIVE UDP/3478 test (supersedes the
+# best-effort nc -u -z / /dev/udp checks, which only confirm a packet LEFT the
+# host: a STUN server ignores non-STUN bytes, so "sent OK / 0 received" looks
+# identical whether 3478 is open or silently dropped). This sends a real RFC 5389
+# binding REQUEST and waits for the binding RESPONSE (the only proof STUN works),
+# then decodes XOR-MAPPED-ADDRESS: the server-reflexive (srflx) address the
+# gateway would use for a DIRECT media path. No srflx => relay-only => the extra
+# hop users feel as "slow RBI/RDP".
+if [ "$DO_NET" = "yes" ]; then
+  STUNPY="$OUT/.stun_probe.py"
+  cat > "$STUNPY" <<'PY'
+import os, socket, struct, sys
+host = os.environ.get("STUN_HOST", ""); port = int(os.environ.get("STUN_PORT", "3478"))
+to = float(os.environ.get("STUN_TIMEOUT", "4")); MAGIC = 0x2112A442
+req = struct.pack(">HHI", 0x0001, 0, MAGIC) + os.urandom(12)  # binding request, 0-length body
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(to)
+    s.sendto(req, (host, port)); data, _ = s.recvfrom(1024)
+except socket.timeout:
+    print("STUN_NORESP"); sys.exit(0)
+except Exception as e:
+    print("STUN_ERR " + str(e).replace("\n", " ")); sys.exit(0)
+if len(data) < 20 or struct.unpack(">H", data[0:2])[0] != 0x0101:  # not a binding-success response
+    print("STUN_BADRESP"); sys.exit(0)
+pos, refl = 20, None
+while pos + 4 <= len(data):
+    atype, alen = struct.unpack(">HH", data[pos:pos+4]); v = data[pos+4:pos+4+alen]
+    if atype in (0x0020, 0x0001) and len(v) >= 8 and v[1] == 0x01:  # (XOR-)MAPPED-ADDRESS, IPv4
+        if atype == 0x0020:
+            xport = struct.unpack(">H", v[2:4])[0] ^ (MAGIC >> 16)
+            ip = struct.unpack(">I", v[4:8])[0] ^ MAGIC
+        else:
+            xport = struct.unpack(">H", v[2:4])[0]; ip = struct.unpack(">I", v[4:8])[0]
+        refl = "%d.%d.%d.%d:%d" % ((ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255, xport)
+        break
+    pos += 4 + alen + ((4 - alen % 4) % 4)  # attrs are 32-bit aligned
+print("STUN_OK " + (refl if refl else "reflexive=?"))
+PY
+  echo "" >> "$WF"
+  echo "active STUN binding probe to ${RELAY}:3478 (definitive UDP egress + srflx candidate):" >> "$WF"
+
+  # host-side: definitive for bridge-mode containers (container SNATs through the host)
+  if have python3; then
+    HS="$(STUN_HOST="$RELAY" STUN_PORT=3478 STUN_TIMEOUT="$TIMEOUT" python3 "$STUNPY" 2>/dev/null)"
+    echo "  host:      ${HS:-STUN_ERR (no output)}" >> "$WF"
+    case "$HS" in
+      STUN_OK*)    note "STUN OK from host: UDP/3478 to relay is OPEN; reflexive ${HS#STUN_OK } is the srflx candidate for a DIRECT media path" ;;
+      STUN_NORESP) note "WARN: no STUN binding response from host in ${TIMEOUT}s -- outbound UDP/3478 to $RELAY is BLOCKED/filtered; this forces TURN-relay-only media (the usual 'slow RBI' cause). Open egress UDP/3478." ;;
+      STUN_BADRESP|STUN_ERR*) note "NOTE: host STUN probe returned an unexpected result ($HS) -- see network/webrtc.txt" ;;
+      *) ;;
+    esac
+  else
+    echo "  host:      (python3 unavailable -- host STUN probe skipped)" >> "$WF"
+  fi
+
+  # container-side: the container is what actually performs ICE, so its own
+  # network namespace is the real test. We get it two ways, most-reliable first,
+  # so a container result is captured even on a minimal image:
+  #   1. nsenter into the container's net namespace running the HOST's python3 --
+  #      tests the real container egress regardless of what the image ships
+  #      (only the -n net namespace is entered, so $STUNPY on the host FS is still readable);
+  #   2. docker exec the image's own python3 -- fallback when nsenter is unavailable.
+  if [ "$MODE" = "docker" ] && [ -n "$CONTAINER" ]; then
+    CS=""; CMETHOD=""
+    CPID="$(docker inspect -f '{{.State.Pid}}' "$CONTAINER" 2>/dev/null)"
+    if have nsenter && have python3 && [ -n "$CPID" ] && [ "$CPID" != "0" ]; then
+      CS="$(sudo -n nsenter -t "$CPID" -n env STUN_HOST="$RELAY" STUN_PORT=3478 STUN_TIMEOUT="$TIMEOUT" python3 "$STUNPY" 2>/dev/null \
+            || nsenter -t "$CPID" -n env STUN_HOST="$RELAY" STUN_PORT=3478 STUN_TIMEOUT="$TIMEOUT" python3 "$STUNPY" 2>/dev/null)"
+      [ -n "$CS" ] && CMETHOD="nsenter (host python3 in container netns)"
+    fi
+    if [ -z "$CS" ]; then
+      CS="$(docker exec -i -e STUN_HOST="$RELAY" -e STUN_PORT=3478 -e STUN_TIMEOUT="$TIMEOUT" "$CONTAINER" python3 - < "$STUNPY" 2>/dev/null)"
+      [ -n "$CS" ] && CMETHOD="docker exec (image python3)"
+    fi
+    if [ -z "$CS" ]; then
+      echo "  container: (no nsenter+python3 on host and no python3 in image -- container probe skipped; host result applies for bridge NAT)" >> "$WF"
+    else
+      echo "  container: $CS   [via $CMETHOD]" >> "$WF"
+      case "$CS" in
+        STUN_NORESP) note "WARN: container got NO STUN response -- UDP/3478 is blocked from the container's network namespace; media will be relay-only or fail (check the docker network + host egress)" ;;
+        STUN_OK*)    note "STUN OK from container: srflx ${CS#STUN_OK } is reachable -- if gateway logs STILL show relay-only candidates, the fallback is NAT-type/config (e.g. symmetric NAT), not a blocked port" ;;
+        *) ;;
+      esac
+    fi
+  fi
+  rm -f "$STUNPY" 2>/dev/null
 fi
 
 # live conntrack entries for the relay (best evidence of an active media flow)
@@ -736,7 +848,12 @@ if [ -n "$GWLOG" ]; then
     grep -iE 'latency to .*krelay|latency to .*3478' "$GWLOG" 2>/dev/null | tail -5
   } >> "$WF"
   if [ "${C_RELAY:-0}" -gt 0 ] 2>/dev/null && [ "${C_HOST:-0}" -eq 0 ] 2>/dev/null; then
-    note "NOTE: sessions use the TURN relay (no direct/host candidates) -- expected for a bridge-mode container behind NAT; adds latency, the usual cause of 'slow' RBI/RDP on a VPS gateway"
+    case "$(printf '%s' "${TURN_ONLY:-}" | tr 'A-Z' 'a-z')" in
+      1|true|yes|on)
+        note "NOTE: relay-only candidates -- but KEEPER_GATEWAY_TUNNEL_ONLY_USE_TURN is set, so this is forced by config (expected, not a network fault)" ;;
+      *)
+        note "NOTE: sessions use the TURN relay (no direct/host candidates) -- expected for a bridge-mode container behind NAT; adds latency, the usual cause of 'slow' RBI/RDP on a VPS gateway. Cross-check the STUN probe above: if it returned a srflx, a direct path IS reachable and the fallback is NAT-type/config" ;;
+    esac
   fi
 
   # IPv6 ICE noise: gateway attempting IPv6 STUN with no container IPv6 path
@@ -785,8 +902,10 @@ Enabling verbose Gateway debug logs (do this WITH support, then revert)
 
 Docker / Docker Compose:
   In the keeper-gateway service "environment:" block add:
-      KEEPER_GATEWAY_LOG_LEVEL: "debug"   # gateway
-      LOG_LEVEL: "debug"                  # guacd
+      KEEPER_GATEWAY_LOG_LEVEL: "debug"        # gateway
+      LOG_LEVEL: "debug"                       # guacd
+      KEEPER_GATEWAY_INCLUDE_WEBRTC_LOGS: "1"  # ICE candidate types (relay/srflx/host) + RTT
+                                               # -- REQUIRED for the WebRTC media-path analysis
   Apply and restart:
       docker compose up -d
   Tail:
